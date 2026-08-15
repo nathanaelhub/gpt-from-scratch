@@ -31,6 +31,12 @@ def softmax(x, axis=-1):
     return e / e.sum(axis=axis, keepdims=True)
 
 
+def log_softmax(x, axis=-1):
+    """log(softmax(x)) computed stably as z - log(sum(exp(z))), z = x - max."""
+    z = x - x.max(axis=axis, keepdims=True)
+    return z - np.log(np.exp(z).sum(axis=axis, keepdims=True))
+
+
 # tanh-approximation GELU (what GPT-2 uses) and its exact derivative
 _GC = np.sqrt(2.0 / np.pi)
 
@@ -275,12 +281,19 @@ class GPT:
         return self.head.forward(x)                         # logits (B,T,vocab)
 
     def loss(self, idx, targets):
-        """Mean cross-entropy over all positions; caches for backward()."""
+        """Mean cross-entropy over all positions; caches for backward().
+
+        Computed as a log-softmax (logits - logsumexp) rather than log(softmax),
+        so the result is exact even when the softmax underflows to 0 for the
+        target class — no epsilon fudge needed, and the gradient in backward()
+        is still just probs - onehot.
+        """
         logits = self.forward(idx)
         B, T, V = logits.shape
-        self.probs = softmax(logits, axis=-1)
         self.targets = targets
-        ll = np.log(self.probs.reshape(-1, V)[np.arange(B * T), targets.reshape(-1)] + 1e-12)
+        logp = log_softmax(logits, axis=-1)
+        self.probs = np.exp(logp)
+        ll = logp.reshape(-1, V)[np.arange(B * T), targets.reshape(-1)]
         return -ll.mean()
 
     def backward(self):

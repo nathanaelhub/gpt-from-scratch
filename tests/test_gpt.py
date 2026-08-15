@@ -11,7 +11,7 @@ import pytest
 
 from gpt.data import CharData
 from gpt.gradcheck import gradcheck
-from gpt.model import GPT, dgelu, gelu, softmax
+from gpt.model import GPT, dgelu, gelu, log_softmax, softmax
 from gpt.optim import Adam
 
 
@@ -31,6 +31,29 @@ def test_softmax_is_shift_invariant_and_stable():
     x = np.array([[1000.0, 1001.0, 1002.0]])   # would overflow without the max trick
     p = softmax(x)
     assert np.isfinite(p).all() and np.allclose(p.sum(), 1.0)
+
+
+def test_log_softmax_matches_log_of_softmax_and_is_exact_at_extremes():
+    x = np.random.default_rng(1).standard_normal((3, 9))
+    assert np.allclose(log_softmax(x), np.log(softmax(x)))
+    # a target class 1e3 below the max: softmax underflows to exactly 0, but the
+    # log-probability is still finite and correct (-1000 - log(1 + e^-1000)).
+    x = np.array([[0.0, -1000.0]])
+    assert softmax(x)[0, 1] == 0.0
+    assert np.isfinite(log_softmax(x)).all()
+    assert np.isclose(log_softmax(x)[0, 1], -1000.0)
+
+
+def test_loss_is_finite_with_extreme_logits():
+    m = GPT(vocab_size=5, block_size=4, n_layer=1, n_head=1, n_embd=8, seed=0)
+    m.head.W *= 1e4        # blow the logits up so most probabilities underflow
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, 5, (2, 4))
+    targets = rng.integers(0, 5, (2, 4))
+    loss = m.loss(idx, targets)
+    assert np.isfinite(loss)
+    grads = m.backward()
+    assert all(np.isfinite(g).all() for g in grads.values())
 
 
 def test_gelu_derivative_matches_numeric():
