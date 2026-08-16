@@ -273,6 +273,9 @@ class GPT:
 
     def forward(self, idx):
         B, T = idx.shape
+        if T > self.block_size:
+            raise ValueError(f"sequence length {T} exceeds block_size {self.block_size}; "
+                             "crop the input to the last block_size tokens")
         pos = np.arange(T)
         x = self.wte.forward(idx) + self.wpe.forward(pos)   # (B,T,n_embd)
         for b in self.blocks:

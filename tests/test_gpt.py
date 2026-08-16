@@ -9,7 +9,7 @@ attending to the future), and that the model actually trains.
 import numpy as np
 import pytest
 
-from gpt.data import CharData
+from gpt.data import CharData, encode
 from gpt.gradcheck import gradcheck
 from gpt.model import GPT, dgelu, gelu, log_softmax, softmax
 from gpt.optim import Adam
@@ -68,6 +68,19 @@ def test_forward_shapes():
     idx = np.zeros((3, 8), dtype=np.int64)
     logits = m.forward(idx)
     assert logits.shape == (3, 8, 20)
+
+
+def test_forward_rejects_sequences_longer_than_block_size():
+    m = GPT(vocab_size=20, block_size=8, n_layer=1, n_head=2, n_embd=16)
+    with pytest.raises(ValueError, match="block_size"):
+        m.forward(np.zeros((1, 9), dtype=np.int64))
+
+
+def test_encode_rejects_characters_outside_the_vocab():
+    stoi = {c: i for i, c in enumerate("abc ")}
+    assert encode("cab", stoi).tolist() == [2, 0, 1]
+    with pytest.raises(ValueError, match="'z'"):
+        encode("a z", stoi)
 
 
 def test_attention_is_causal():

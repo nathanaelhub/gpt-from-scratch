@@ -9,6 +9,7 @@ import argparse
 
 import numpy as np
 
+from gpt.data import encode
 from gpt.model import GPT, softmax
 
 
@@ -25,7 +26,7 @@ def load(path):
 
 def generate(model, stoi, itos, prompt, n, temperature=0.8, top_k=None, seed=0):
     rng = np.random.default_rng(seed)
-    idx = np.array([[stoi.get(c, 0) for c in prompt]], dtype=np.int64)
+    idx = encode(prompt, stoi)[None, :]
     for _ in range(n):
         cond = idx[:, -model.block_size:]
         logits = model.forward(cond)[0, -1] / temperature

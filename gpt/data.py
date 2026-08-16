@@ -27,7 +27,16 @@ class CharData:
         return x, y
 
     def encode(self, s):
-        return np.array([self.stoi[c] for c in s], dtype=np.int64)
+        return encode(s, self.stoi)
 
     def decode(self, ids):
         return "".join(self.itos[int(i)] for i in ids)
+
+
+def encode(s, stoi):
+    """Map a string to token ids, failing loudly on characters outside the vocab
+    (silently substituting a token would corrupt the prompt without warning)."""
+    unknown = sorted(set(s) - stoi.keys())
+    if unknown:
+        raise ValueError(f"characters not in the model's vocabulary: {unknown!r}")
+    return np.array([stoi[c] for c in s], dtype=np.int64)
