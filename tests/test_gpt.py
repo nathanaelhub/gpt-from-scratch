@@ -12,7 +12,7 @@ import pytest
 from gpt.data import CharData, encode
 from gpt.gradcheck import gradcheck
 from gpt.model import GPT, dgelu, gelu, log_softmax, softmax
-from gpt.optim import Adam
+from gpt.optim import Adam, clip_grad_norm
 
 
 def test_gradients_match_finite_differences():
@@ -117,3 +117,18 @@ def test_char_data_roundtrip(tmp_path):
     x, y = d.get_batch("train", 3)
     assert x.shape == (3, 4) and y.shape == (3, 4)
     assert (y[:, :-1] == x[:, 1:]).all()   # targets are inputs shifted by one
+
+
+def test_clip_grad_norm_bounds_the_global_norm_and_keeps_direction():
+    rng = np.random.default_rng(0)
+    grads = {"a": rng.standard_normal((5, 5)) * 10, "b": rng.standard_normal(5) * 10}
+    before = {k: v.copy() for k, v in grads.items()}
+    pre = clip_grad_norm(grads, 1.0)
+    post = np.sqrt(sum((g * g).sum() for g in grads.values()))
+    assert pre > 1.0 and np.isclose(post, 1.0, atol=1e-5)
+    for k in grads:                       # same direction, just rescaled
+        assert np.allclose(grads[k] / post, before[k] / pre)
+    # already small: untouched
+    small = {"a": np.full(3, 0.1)}
+    clip_grad_norm(small, 1.0)
+    assert np.allclose(small["a"], 0.1)

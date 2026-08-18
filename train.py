@@ -14,7 +14,7 @@ import numpy as np
 
 from gpt.data import CharData
 from gpt.model import GPT
-from gpt.optim import Adam
+from gpt.optim import Adam, clip_grad_norm
 
 
 def estimate_loss(model, data, batch_size, iters=20):
@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--n-head", type=int, default=4)
     ap.add_argument("--n-embd", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-3)
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="clip the global gradient norm to this value (0 = off)")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--out", default="checkpoint.npz")
     args = ap.parse_args()
@@ -56,11 +58,13 @@ def main():
     for step in range(1, args.steps + 1):
         x, y = data.get_batch("train", args.batch_size)
         model.loss(x, y)
-        opt.step(model.backward())
+        grads = model.backward()
+        gnorm = clip_grad_norm(grads, args.grad_clip)
+        opt.step(grads)
         if step == 1 or step % args.eval_every == 0:
             e = estimate_loss(model, data, args.batch_size)
             print(f"  step {step:5d} | train {e['train']:.3f} | val {e['val']:.3f} "
-                  f"| {time.time() - t0:.0f}s")
+                  f"| grad norm {gnorm:.2f} | {time.time() - t0:.0f}s")
 
     save(args.out, model, data,
          [data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd])

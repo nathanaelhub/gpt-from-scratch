@@ -1,4 +1,5 @@
-"""Adam optimizer, operating in place on the model's parameter arrays."""
+"""Adam optimizer (operating in place on the model's parameter arrays) and
+gradient-norm clipping."""
 from __future__ import annotations
 
 import numpy as np
@@ -26,3 +27,18 @@ class Adam:
             mhat = self.m[k] / bc1
             vhat = self.v[k] / bc2
             p -= self.lr * mhat / (np.sqrt(vhat) + self.eps)   # in-place
+
+
+def clip_grad_norm(grads, max_norm):
+    """Scale all gradients in place so their global L2 norm is at most max_norm.
+
+    Returns the norm *before* clipping (useful to log — a spike is the usual
+    sign that the learning rate is too high). Clipping the global norm rather
+    than each tensor keeps the update direction unchanged.
+    """
+    total = float(np.sqrt(sum(float((g * g).sum()) for g in grads.values())))
+    if max_norm and total > max_norm:
+        scale = max_norm / (total + 1e-6)
+        for g in grads.values():
+            g *= scale
+    return total
