@@ -12,7 +12,7 @@ import pytest
 from gpt.data import CharData, encode
 from gpt.gradcheck import gradcheck
 from gpt.model import GPT, dgelu, gelu, log_softmax, softmax
-from gpt.optim import Adam, clip_grad_norm
+from gpt.optim import Adam, clip_grad_norm, lr_at
 
 
 def test_gradients_match_finite_differences():
@@ -132,3 +132,15 @@ def test_clip_grad_norm_bounds_the_global_norm_and_keeps_direction():
     small = {"a": np.full(3, 0.1)}
     clip_grad_norm(small, 1.0)
     assert np.allclose(small["a"], 0.1)
+
+
+def test_lr_schedule_warms_up_then_cosine_decays_to_min():
+    peak, total, warm, floor = 1e-2, 1000, 100, 1e-3
+    sched = [lr_at(s, peak, total, warm, floor) for s in range(1, total + 1)]
+    assert np.isclose(sched[0], peak / warm)          # step 1 of warmup
+    assert np.isclose(sched[warm - 1], peak)          # reaches the peak
+    assert np.isclose(sched[-1], floor)               # ends at min_lr
+    assert all(b <= a + 1e-12 for a, b in zip(sched[warm - 1:], sched[warm:]))  # monotone after warmup
+    assert all(floor - 1e-12 <= v <= peak + 1e-12 for v in sched[warm:])  # bounded once warm
+    # warmup=0 means no ramp: starts at the peak
+    assert np.isclose(lr_at(1, peak, total, 0, floor), peak, rtol=1e-4)

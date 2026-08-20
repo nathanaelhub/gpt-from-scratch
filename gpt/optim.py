@@ -1,5 +1,5 @@
-"""Adam optimizer (operating in place on the model's parameter arrays) and
-gradient-norm clipping."""
+"""Adam optimizer (operating in place on the model's parameter arrays),
+gradient-norm clipping, and the learning-rate schedule."""
 from __future__ import annotations
 
 import numpy as np
@@ -42,3 +42,14 @@ def clip_grad_norm(grads, max_norm):
         for g in grads.values():
             g *= scale
     return total
+
+
+def lr_at(step, max_lr, total_steps, warmup=0, min_lr=0.0):
+    """Linear warmup to max_lr over `warmup` steps, then cosine decay to min_lr
+    at total_steps (the GPT-2 / nanoGPT schedule). Steps are 1-based."""
+    if warmup and step <= warmup:
+        return max_lr * step / warmup
+    if step >= total_steps:
+        return min_lr
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    return min_lr + 0.5 * (1.0 + np.cos(np.pi * progress)) * (max_lr - min_lr)
