@@ -144,3 +144,17 @@ def test_lr_schedule_warms_up_then_cosine_decays_to_min():
     assert all(floor - 1e-12 <= v <= peak + 1e-12 for v in sched[warm:])  # bounded once warm
     # warmup=0 means no ramp: starts at the peak
     assert np.isclose(lr_at(1, peak, total, 0, floor), peak, rtol=1e-4)
+
+
+def test_weight_decay_is_decoupled_and_skips_1d_params():
+    W = np.full((4, 4), 1.0); gamma = np.full(4, 1.0); b = np.full(4, 1.0)
+    params = {"W": W, "ln.gamma": gamma, "b": b}
+    zero = {k: np.zeros_like(v) for k, v in params.items()}
+    opt = Adam(params, lr=0.1, weight_decay=0.5)
+    opt.step(zero)                       # no gradient signal: only decay can move anything
+    assert np.allclose(W, 1.0 - 0.1 * 0.5)       # p *= 1 - lr*wd, independent of Adam's v
+    assert np.allclose(gamma, 1.0) and np.allclose(b, 1.0)   # 1-D params untouched
+    # and with wd=0 nothing moves at all
+    W2 = np.full((2, 2), 1.0)
+    Adam({"W": W2}, lr=0.1, weight_decay=0.0).step({"W": np.zeros((2, 2))})
+    assert np.allclose(W2, 1.0)

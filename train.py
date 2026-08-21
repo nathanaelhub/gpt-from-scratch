@@ -46,6 +46,8 @@ def main():
                     help="linear warmup steps before cosine decay (0 = constant lr)")
     ap.add_argument("--min-lr", type=float, default=3e-4,
                     help="learning rate the cosine schedule decays to by the last step")
+    ap.add_argument("--weight-decay", type=float, default=0.1,
+                    help="decoupled (AdamW) weight decay on matmul/embedding weights")
     ap.add_argument("--grad-clip", type=float, default=1.0,
                     help="clip the global gradient norm to this value (0 = off)")
     ap.add_argument("--eval-every", type=int, default=250)
@@ -54,7 +56,7 @@ def main():
 
     data = CharData(args.data, args.block_size)
     model = GPT(data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd)
-    opt = Adam(model.params(), lr=args.lr)
+    opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
     n_params = sum(p.size for p in model.params().values())
     print(f"corpus vocab {data.vocab_size} | {n_params:,} parameters | {args.steps} steps")
 
