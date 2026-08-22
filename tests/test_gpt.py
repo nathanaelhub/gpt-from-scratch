@@ -9,6 +9,7 @@ attending to the future), and that the model actually trains.
 import numpy as np
 import pytest
 
+from gpt import checkpoint
 from gpt.data import CharData, encode
 from gpt.gradcheck import gradcheck
 from gpt.model import GPT, dgelu, gelu, log_softmax, softmax
@@ -158,3 +159,28 @@ def test_weight_decay_is_decoupled_and_skips_1d_params():
     W2 = np.full((2, 2), 1.0)
     Adam({"W": W2}, lr=0.1, weight_decay=0.0).step({"W": np.zeros((2, 2))})
     assert np.allclose(W2, 1.0)
+
+
+def test_checkpoint_roundtrips_model_and_optimizer(tmp_path):
+    m = GPT(vocab_size=6, block_size=4, n_layer=1, n_head=2, n_embd=8, seed=3)
+    opt = Adam(m.params(), lr=1e-2)
+    rng = np.random.default_rng(0)
+    x = rng.integers(0, 6, (2, 4)); y = rng.integers(0, 6, (2, 4))
+    for _ in range(3):
+        m.loss(x, y); opt.step(m.backward())
+    itos = dict(enumerate("abcdef"))
+    path = tmp_path / "ck.npz"
+    checkpoint.save(path, m, itos, [6, 4, 1, 2, 8], step=3, opt=opt)
+    assert not (tmp_path / "ck.npz.tmp").exists()      # atomic rename cleaned up
+
+    m2, stoi, itos2, step = checkpoint.load(path)
+    assert step == 3 and itos2 == itos and stoi["c"] == 2
+    for k, v in m.params().items():
+        assert np.array_equal(v, m2.params()[k])
+    assert np.allclose(m.forward(x), m2.forward(x))
+
+    opt2 = Adam(m2.params(), lr=1e-2)
+    checkpoint.load(path, opt=opt2)
+    assert opt2.t == 3
+    for k in opt.m:
+        assert np.array_equal(opt.m[k], opt2.m[k]) and np.array_equal(opt.v[k], opt2.v[k])

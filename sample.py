@@ -9,19 +9,9 @@ import argparse
 
 import numpy as np
 
+from gpt import checkpoint
 from gpt.data import encode
-from gpt.model import GPT, softmax
-
-
-def load(path):
-    d = np.load(path, allow_pickle=False)
-    vocab, block, nl, nh, ne = (int(v) for v in d["config"])
-    model = GPT(vocab, block, nl, nh, ne)
-    for k, arr in model.params().items():
-        arr[...] = d[f"p/{k}"]
-    itos = {i: str(c) for i, c in enumerate(d["chars"])}
-    stoi = {c: i for i, c in itos.items()}
-    return model, stoi, itos
+from gpt.model import softmax
 
 
 def generate(model, stoi, itos, prompt, n, temperature=0.8, top_k=None, seed=0):
@@ -49,7 +39,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    model, stoi, itos = load(args.ckpt)
+    model, stoi, itos, _ = checkpoint.load(args.ckpt)
     print(generate(model, stoi, itos, args.prompt, args.n,
                    args.temperature, args.top_k, args.seed))
 

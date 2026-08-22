@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 
+from gpt import checkpoint
 from gpt.data import CharData
 from gpt.model import GPT
 from gpt.optim import Adam, clip_grad_norm, lr_at
@@ -23,13 +24,6 @@ def estimate_loss(model, data, batch_size, iters=20):
         out[split] = float(np.mean([model.loss(*data.get_batch(split, batch_size))
                                      for _ in range(iters)]))
     return out
-
-
-def save(path, model, data, cfg):
-    np.savez(path,
-             chars=np.array([data.itos[i] for i in range(data.vocab_size)]),
-             config=np.array(cfg),
-             **{f"p/{k}": v for k, v in model.params().items()})
 
 
 def main():
@@ -50,32 +44,52 @@ def main():
                     help="decoupled (AdamW) weight decay on matmul/embedding weights")
     ap.add_argument("--grad-clip", type=float, default=1.0,
                     help="clip the global gradient norm to this value (0 = off)")
-    ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--eval-every", type=int, default=250,
+                    help="evaluate and write a checkpoint every N steps")
+    ap.add_argument("--seed", type=int, default=0, help="model init + batch sampling seed")
     ap.add_argument("--out", default="checkpoint.npz")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue training from --out (params, Adam state, and step)")
     args = ap.parse_args()
 
-    data = CharData(args.data, args.block_size)
-    model = GPT(data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd)
-    opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
+    data = CharData(args.data, args.block_size, seed=args.seed)
+    if args.resume:
+        model, _, _, start = checkpoint.load(args.out)
+        opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
+        checkpoint.load(args.out, opt=opt)
+        print(f"resumed {args.out} at step {start}")
+    else:
+        model = GPT(data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd,
+                    seed=args.seed)
+        opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
+        start = 0
+    cfg = [model.wte.W.shape[0], model.block_size, len(model.blocks),
+           model.blocks[0].attn.n_head, model.wte.W.shape[1]]
     n_params = sum(p.size for p in model.params().values())
     print(f"corpus vocab {data.vocab_size} | {n_params:,} parameters | {args.steps} steps")
 
-    t0 = time.time()
-    for step in range(1, args.steps + 1):
-        x, y = data.get_batch("train", args.batch_size)
-        opt.lr = lr_at(step, args.lr, args.steps, args.warmup, args.min_lr)
-        model.loss(x, y)
-        grads = model.backward()
-        gnorm = clip_grad_norm(grads, args.grad_clip)
-        opt.step(grads)
-        if step == 1 or step % args.eval_every == 0:
-            e = estimate_loss(model, data, args.batch_size)
-            print(f"  step {step:5d} | train {e['train']:.3f} | val {e['val']:.3f} "
-                  f"| lr {opt.lr:.2e} | grad norm {gnorm:.2f} | {time.time() - t0:.0f}s")
+    def save(step):
+        checkpoint.save(args.out, model, data.itos, cfg, step=step, opt=opt)
 
-    save(args.out, model, data,
-         [data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd])
-    print(f"saved {args.out}")
+    t0 = time.time()
+    step = start
+    try:
+        for step in range(start + 1, args.steps + 1):
+            x, y = data.get_batch("train", args.batch_size)
+            opt.lr = lr_at(step, args.lr, args.steps, args.warmup, args.min_lr)
+            model.loss(x, y)
+            grads = model.backward()
+            gnorm = clip_grad_norm(grads, args.grad_clip)
+            opt.step(grads)
+            if step == 1 or step % args.eval_every == 0:
+                e = estimate_loss(model, data, args.batch_size)
+                print(f"  step {step:5d} | train {e['train']:.3f} | val {e['val']:.3f} "
+                      f"| lr {opt.lr:.2e} | grad norm {gnorm:.2f} | {time.time() - t0:.0f}s")
+                save(step)
+    except KeyboardInterrupt:
+        print(f"\ninterrupted at step {step}; saving")
+    save(step)
+    print(f"saved {args.out} (step {step})")
 
 
 if __name__ == "__main__":
