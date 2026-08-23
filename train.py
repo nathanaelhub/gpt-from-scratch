@@ -8,6 +8,7 @@ Writes a checkpoint (params + vocab + config) that sample.py can generate from.
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 
 import numpy as np
@@ -50,6 +51,8 @@ def main():
     ap.add_argument("--out", default="checkpoint.npz")
     ap.add_argument("--resume", action="store_true",
                     help="continue training from --out (params, Adam state, and step)")
+    ap.add_argument("--log", default="train_log.csv",
+                    help="CSV of step, train/val loss, lr, grad norm ('' to disable)")
     args = ap.parse_args()
 
     data = CharData(args.data, args.block_size, seed=args.seed)
@@ -71,6 +74,14 @@ def main():
     def save(step):
         checkpoint.save(args.out, model, data.itos, cfg, step=step, opt=opt)
 
+    log = None
+    if args.log:
+        # append when resuming so the curve stays continuous; otherwise start fresh
+        f = open(args.log, "a" if args.resume else "w", newline="", encoding="utf-8")
+        log = csv.writer(f)
+        if not args.resume:
+            log.writerow(["step", "train_loss", "val_loss", "lr", "grad_norm", "seconds"])
+
     t0 = time.time()
     step = start
     try:
@@ -85,10 +96,16 @@ def main():
                 e = estimate_loss(model, data, args.batch_size)
                 print(f"  step {step:5d} | train {e['train']:.3f} | val {e['val']:.3f} "
                       f"| lr {opt.lr:.2e} | grad norm {gnorm:.2f} | {time.time() - t0:.0f}s")
+                if log:
+                    log.writerow([step, f"{e['train']:.4f}", f"{e['val']:.4f}",
+                                  f"{opt.lr:.3e}", f"{gnorm:.3f}", f"{time.time() - t0:.1f}"])
+                    f.flush()
                 save(step)
     except KeyboardInterrupt:
         print(f"\ninterrupted at step {step}; saving")
     save(step)
+    if log:
+        f.close()
     print(f"saved {args.out} (step {step})")
 
 
