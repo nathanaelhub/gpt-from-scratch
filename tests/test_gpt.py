@@ -184,3 +184,19 @@ def test_checkpoint_roundtrips_model_and_optimizer(tmp_path):
     assert opt2.t == 3
     for k in opt.m:
         assert np.array_equal(opt.m[k], opt2.m[k]) and np.array_equal(opt.v[k], opt2.v[k])
+
+
+def test_evaluate_covers_every_block_and_matches_manual_mean(tmp_path):
+    from eval import evaluate
+    p = tmp_path / "corpus.txt"
+    p.write_text("abcabcabcabcabcabcabcabcabcabcab", encoding="utf-8")   # 32 chars
+    d = CharData(str(p), block_size=4, split=1.0)
+    m = GPT(vocab_size=3, block_size=4, n_layer=1, n_head=1, n_embd=8, seed=0)
+    ids = d.train                                    # 32 tokens -> 7 full blocks
+    got = evaluate(m, ids, 4, batch_size=3)          # forces several partial batches
+    # manual: per-token losses over the same 7 blocks
+    x = np.stack([ids[i * 4:(i + 1) * 4] for i in range(7)])
+    y = np.stack([ids[i * 4 + 1:(i + 1) * 4 + 1] for i in range(7)])
+    assert np.isclose(got, m.loss(x, y))
+    with pytest.raises(ValueError):
+        evaluate(m, ids[:3], 4)
