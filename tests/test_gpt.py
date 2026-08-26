@@ -200,3 +200,37 @@ def test_evaluate_covers_every_block_and_matches_manual_mean(tmp_path):
     assert np.isclose(got, m.loss(x, y))
     with pytest.raises(ValueError):
         evaluate(m, ids[:3], 4)
+
+
+def test_kv_cache_matches_full_recompute_at_every_prefix():
+    m = GPT(vocab_size=20, block_size=8, n_layer=2, n_head=2, n_embd=16, seed=4)
+    rng = np.random.default_rng(5)
+    idx = rng.integers(0, 20, (1, 8))
+    full = m.forward(idx)                              # (1,8,20), no cache
+    # token by token
+    cache = m.new_cache()
+    for t in range(8):
+        step = m.forward(idx[:, t:t + 1], cache)
+        assert np.allclose(step[0, 0], full[0, t]), f"mismatch at position {t}"
+    assert m.cache_len(cache) == 8
+    # prompt chunk, then the rest one at a time
+    cache = m.new_cache()
+    chunk = m.forward(idx[:, :5], cache)
+    assert np.allclose(chunk[0], full[0, :5])
+    for t in range(5, 8):
+        assert np.allclose(m.forward(idx[:, t:t + 1], cache)[0, 0], full[0, t])
+    # overflowing the window is refused, same as without a cache
+    with pytest.raises(ValueError, match="block_size"):
+        m.forward(idx[:, :1], cache)
+
+
+def test_generate_with_cache_matches_uncached_within_one_window():
+    from sample import generate
+    m = GPT(vocab_size=4, block_size=16, n_layer=1, n_head=2, n_embd=8, seed=0)
+    itos = dict(enumerate("abcd")); stoi = {c: i for i, c in itos.items()}
+    a = generate(m, stoi, itos, "ab", 10, seed=1, use_cache=True)
+    b = generate(m, stoi, itos, "ab", 10, seed=1, use_cache=False)
+    assert a == b and len(a) == 12
+    # past the window the cached sampler must still run and respect block_size
+    long = generate(m, stoi, itos, "ab", 40, seed=1, use_cache=True)
+    assert len(long) == 42 and set(long) <= set("abcd")

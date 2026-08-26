@@ -153,19 +153,32 @@ class CausalSelfAttention:
         # (B,T,dim) -> (B, n_head, T, hd)
         return t.reshape(B, T, self.n_head, self.hd).transpose(0, 2, 1, 3)
 
-    def forward(self, x):
+    def forward(self, x, cache=None):
+        """x: (B,T,dim). With `cache` (a dict) the keys/values of earlier
+        tokens are read from and appended to it, so x may hold only the *new*
+        tokens — this is what makes autoregressive sampling O(T) per step
+        instead of O(T^2). The training path (cache=None) is unchanged."""
         B, T, dim = x.shape
         self.B, self.T = B, T
         qkv = self.c_attn.forward(x)                       # (B,T,3dim)
         q, k, v = np.split(qkv, 3, axis=-1)
-        self.q, self.k, self.v = (self._split(t, B, T) for t in (q, k, v))
+        q, k, v = (self._split(t, B, T) for t in (q, k, v))
+        if cache is not None:
+            if "k" in cache:
+                k = np.concatenate([cache["k"], k], axis=2)
+                v = np.concatenate([cache["v"], v], axis=2)
+            cache["k"], cache["v"] = k, v
+        self.q, self.k, self.v = q, k, v
+        Tk = k.shape[2]                                    # keys = past + new
+        past = Tk - T
         scale = 1.0 / np.sqrt(self.hd)
-        att = (self.q @ self.k.transpose(0, 1, 3, 2)) * scale   # (B,nh,T,T)
-        mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+        att = (q @ k.transpose(0, 1, 3, 2)) * scale        # (B,nh,T,Tk)
+        # query i sits at absolute position past+i and may see keys <= past+i
+        mask = np.triu(np.ones((T, Tk), dtype=bool), k=past + 1)
         att = np.where(mask, -1e9, att)
         self.p = softmax(att, axis=-1)
         self.scale = scale
-        y = self.p @ self.v                                # (B,nh,T,hd)
+        y = self.p @ v                                     # (B,nh,T,hd)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, dim)     # merge heads
         return self.c_proj.forward(y)
 
@@ -231,8 +244,8 @@ class Block:
                 **{f"ln2.{k}": v for k, v in self.ln2.params().items()},
                 **{f"mlp.{k}": v for k, v in self.mlp.params().items()}}
 
-    def forward(self, x):
-        x = x + self.attn.forward(self.ln1.forward(x))
+    def forward(self, x, cache=None):
+        x = x + self.attn.forward(self.ln1.forward(x), cache)
         x = x + self.mlp.forward(self.ln2.forward(x))
         return x
 
@@ -271,15 +284,27 @@ class GPT:
             p.update({f"block{i}.{k}": v for k, v in b.params().items()})
         return p
 
-    def forward(self, idx):
+    def new_cache(self):
+        """One KV cache per block, for forward(idx, cache=...)."""
+        return [{} for _ in self.blocks]
+
+    @staticmethod
+    def cache_len(cache):
+        return cache[0]["k"].shape[2] if cache and "k" in cache[0] else 0
+
+    def forward(self, idx, cache=None):
+        """idx: (B,T) token ids -> logits (B,T,vocab). With a cache from
+        new_cache(), idx holds only tokens not yet in the cache and positions
+        continue from where the cache left off."""
         B, T = idx.shape
-        if T > self.block_size:
-            raise ValueError(f"sequence length {T} exceeds block_size {self.block_size}; "
+        past = self.cache_len(cache)
+        if past + T > self.block_size:
+            raise ValueError(f"sequence length {past + T} exceeds block_size {self.block_size}; "
                              "crop the input to the last block_size tokens")
-        pos = np.arange(T)
+        pos = np.arange(past, past + T)
         x = self.wte.forward(idx) + self.wpe.forward(pos)   # (B,T,n_embd)
-        for b in self.blocks:
-            x = b.forward(x)
+        for i, b in enumerate(self.blocks):
+            x = b.forward(x, cache[i] if cache is not None else None)
         x = self.ln_f.forward(x)
         return self.head.forward(x)                         # logits (B,T,vocab)
 
