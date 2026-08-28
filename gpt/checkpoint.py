@@ -44,7 +44,7 @@ def load(path, opt=None):
     step counter are restored too (when the checkpoint has them)."""
     d = np.load(path, allow_pickle=False)
     vocab, block, nl, nh, ne = (int(v) for v in d["config"])
-    model = GPT(vocab, block, nl, nh, ne)
+    model = GPT(vocab, block, nl, nh, ne).eval()     # inference mode; train.py re-enables dropout
     for k, arr in model.params().items():
         arr[...] = d[f"p/{k}"]
     itos = {i: str(c) for i, c in enumerate(d["chars"])}

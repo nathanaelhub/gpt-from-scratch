@@ -12,7 +12,7 @@ import pytest
 from gpt import checkpoint
 from gpt.data import CharData, encode
 from gpt.gradcheck import gradcheck
-from gpt.model import GPT, dgelu, gelu, log_softmax, softmax
+from gpt.model import GPT, Dropout, dgelu, gelu, log_softmax, softmax
 from gpt.optim import Adam, clip_grad_norm, lr_at
 
 
@@ -234,3 +234,38 @@ def test_generate_with_cache_matches_uncached_within_one_window():
     # past the window the cached sampler must still run and respect block_size
     long = generate(m, stoi, itos, "ab", 40, seed=1, use_cache=True)
     assert len(long) == 42 and set(long) <= set("abcd")
+
+
+def test_dropout_is_identity_in_eval_and_mean_preserving_in_train():
+    rng = np.random.default_rng(0)
+    d = Dropout(0.3, rng)
+    x = np.ones((200, 200))
+    y = d.forward(x)
+    kept = y != 0
+    assert np.isclose(kept.mean(), 0.7, atol=0.02)          # ~p dropped
+    assert np.allclose(y[kept], 1 / 0.7)                    # survivors scaled up
+    assert np.isclose(y.mean(), 1.0, atol=0.02)             # expectation preserved
+    g = d.backward(np.ones_like(x))
+    assert np.array_equal(g, y)                             # same mask flows back
+    d.training = False
+    assert d.forward(x) is x and d.backward(x) is x
+    assert Dropout(0.0, rng).forward(x) is x
+
+
+def test_gradients_match_finite_differences_with_dropout_on():
+    worst = gradcheck(verbose=False, dropout=0.2)
+    assert worst < 1e-4, f"gradient check with dropout failed: {worst:.2e}"
+
+
+def test_model_dropout_only_acts_in_train_mode():
+    m = GPT(vocab_size=10, block_size=6, n_layer=1, n_head=2, n_embd=8, seed=0, dropout=0.5)
+    idx = np.random.default_rng(1).integers(0, 10, (2, 6))
+    m.eval()
+    a, b = m.forward(idx), m.forward(idx)
+    assert np.array_equal(a, b)                             # deterministic when off
+    m.train()
+    c, d = m.forward(idx), m.forward(idx)
+    assert not np.allclose(c, d) and not np.allclose(a, c)  # stochastic when on
+    m.reseed_dropout(7); e = m.forward(idx)
+    m.reseed_dropout(7); f = m.forward(idx)
+    assert np.array_equal(e, f)                             # reseeding fixes the masks

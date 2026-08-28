@@ -13,13 +13,20 @@ import numpy as np
 from .model import GPT
 
 
-def gradcheck(eps=1e-5, n_per_param=6, seed=0, verbose=True):
-    model = GPT(vocab_size=13, block_size=8, n_layer=2, n_head=2, n_embd=16, seed=seed)
+def gradcheck(eps=1e-5, n_per_param=6, seed=0, verbose=True, dropout=0.0):
+    model = GPT(vocab_size=13, block_size=8, n_layer=2, n_head=2, n_embd=16, seed=seed,
+                dropout=dropout)
     rng = np.random.default_rng(seed + 1)
     idx = rng.integers(0, 13, (2, 8))
     targets = rng.integers(0, 13, (2, 8))
 
-    model.loss(idx, targets)
+    # with dropout on, every loss() must see the *same* masks, so restart the
+    # mask stream before each call
+    def loss():
+        model.reseed_dropout(seed + 2)
+        return model.loss(idx, targets)
+
+    loss()
     grads = model.backward()
     params = model.params()
 
@@ -32,9 +39,9 @@ def gradcheck(eps=1e-5, n_per_param=6, seed=0, verbose=True):
         for i in picks:
             orig = flat[i]
             flat[i] = orig + eps
-            lp = model.loss(idx, targets)
+            lp = loss()
             flat[i] = orig - eps
-            lm = model.loss(idx, targets)
+            lm = loss()
             flat[i] = orig
             num = (lp - lm) / (2 * eps)
             ana = gflat[i]

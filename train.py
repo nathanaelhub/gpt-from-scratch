@@ -21,9 +21,11 @@ from gpt.optim import Adam, clip_grad_norm, lr_at
 
 def estimate_loss(model, data, batch_size, iters=20):
     out = {}
+    model.eval()
     for split in ("train", "val"):
         out[split] = float(np.mean([model.loss(*data.get_batch(split, batch_size))
                                      for _ in range(iters)]))
+    model.train()
     return out
 
 
@@ -41,6 +43,8 @@ def main():
                     help="linear warmup steps before cosine decay (0 = constant lr)")
     ap.add_argument("--min-lr", type=float, default=3e-4,
                     help="learning rate the cosine schedule decays to by the last step")
+    ap.add_argument("--dropout", type=float, default=0.1,
+                    help="dropout on embeddings, attention weights and residual branches")
     ap.add_argument("--weight-decay", type=float, default=0.1,
                     help="decoupled (AdamW) weight decay on matmul/embedding weights")
     ap.add_argument("--grad-clip", type=float, default=1.0,
@@ -58,12 +62,13 @@ def main():
     data = CharData(args.data, args.block_size, seed=args.seed)
     if args.resume:
         model, _, _, start = checkpoint.load(args.out)
+        model.set_dropout(args.dropout).train()
         opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
         checkpoint.load(args.out, opt=opt)
         print(f"resumed {args.out} at step {start}")
     else:
         model = GPT(data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd,
-                    seed=args.seed)
+                    seed=args.seed, dropout=args.dropout)
         opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
         start = 0
     cfg = [model.wte.W.shape[0], model.block_size, len(model.blocks),

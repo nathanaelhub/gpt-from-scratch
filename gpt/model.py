@@ -134,15 +134,37 @@ class LayerNorm:
         return dx
 
 
+class Dropout:
+    """Inverted dropout. Training: zero each element with probability p and
+    scale the survivors by 1/(1-p) so the expected activation is unchanged;
+    the backward pass is the same mask (d(x*m)/dx = m). Eval, or p=0: identity.
+    Masks come from `rng`, which the model can reseed for gradient checking."""
+
+    def __init__(self, p, rng):
+        self.p, self.rng, self.training = p, rng, True
+        self.mask = None
+
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            self.mask = None
+            return x
+        self.mask = (self.rng.random(x.shape) >= self.p) / (1.0 - self.p)
+        return x * self.mask
+
+    def backward(self, dout):
+        return dout if self.mask is None else dout * self.mask
+
+
 class CausalSelfAttention:
     """Multi-head causal self-attention. dim must be divisible by n_head."""
 
-    def __init__(self, dim, n_head, rng):
+    def __init__(self, dim, n_head, rng, dropout=0.0, drop_rng=None):
         assert dim % n_head == 0
         self.n_head = n_head
         self.hd = dim // n_head
         self.c_attn = Linear(dim, 3 * dim, rng, scale=0.02)  # Q, K, V in one matmul
         self.c_proj = Linear(dim, dim, rng, scale=0.02)
+        self.attn_drop = Dropout(dropout, drop_rng)          # on the attention weights
         self.grads = {}
 
     def params(self):
@@ -178,7 +200,8 @@ class CausalSelfAttention:
         att = np.where(mask, -1e9, att)
         self.p = softmax(att, axis=-1)
         self.scale = scale
-        y = self.p @ v                                     # (B,nh,T,hd)
+        self.pd = self.attn_drop.forward(self.p)           # dropped-out weights
+        y = self.pd @ v                                    # (B,nh,T,hd)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, dim)     # merge heads
         return self.c_proj.forward(y)
 
@@ -186,8 +209,9 @@ class CausalSelfAttention:
         B, T, nh, hd = self.B, self.T, self.n_head, self.hd
         dy = self.c_proj.backward(dout)                    # (B,T,dim)
         dy = dy.reshape(B, T, nh, hd).transpose(0, 2, 1, 3)  # (B,nh,T,hd)
-        dp = dy @ self.v.transpose(0, 1, 3, 2)             # (B,nh,T,T)
-        dv = self.p.transpose(0, 1, 3, 2) @ dy
+        dpd = dy @ self.v.transpose(0, 1, 3, 2)            # (B,nh,T,T) w.r.t. dropped weights
+        dv = self.pd.transpose(0, 1, 3, 2) @ dy
+        dp = self.attn_drop.backward(dpd)                  # through the dropout mask
         # softmax backward, row-wise
         ds = self.p * (dp - (dp * self.p).sum(-1, keepdims=True))
         ds *= self.scale
@@ -229,13 +253,16 @@ class MLP:
 
 
 class Block:
-    """Pre-norm transformer block with residual connections."""
+    """Pre-norm transformer block with residual connections. Dropout sits on
+    each branch's output before it is added back (GPT-2's resid_dropout)."""
 
-    def __init__(self, dim, n_head, rng):
+    def __init__(self, dim, n_head, rng, dropout=0.0, drop_rng=None):
         self.ln1 = LayerNorm(dim)
-        self.attn = CausalSelfAttention(dim, n_head, rng)
+        self.attn = CausalSelfAttention(dim, n_head, rng, dropout, drop_rng)
+        self.drop1 = Dropout(dropout, drop_rng)
         self.ln2 = LayerNorm(dim)
         self.mlp = MLP(dim, rng)
+        self.drop2 = Dropout(dropout, drop_rng)
         self.grads = {}
 
     def params(self):
@@ -245,14 +272,14 @@ class Block:
                 **{f"mlp.{k}": v for k, v in self.mlp.params().items()}}
 
     def forward(self, x, cache=None):
-        x = x + self.attn.forward(self.ln1.forward(x), cache)
-        x = x + self.mlp.forward(self.ln2.forward(x))
+        x = x + self.drop1.forward(self.attn.forward(self.ln1.forward(x), cache))
+        x = x + self.drop2.forward(self.mlp.forward(self.ln2.forward(x)))
         return x
 
     def backward(self, dout):
-        dmlp = self.ln2.backward(self.mlp.backward(dout))
+        dmlp = self.ln2.backward(self.mlp.backward(self.drop2.backward(dout)))
         dout = dout + dmlp                       # residual around the MLP branch
-        dattn = self.ln1.backward(self.attn.backward(dout))
+        dattn = self.ln1.backward(self.attn.backward(self.drop1.backward(dout)))
         dx = dout + dattn                        # residual around the attn branch
         self.grads = {
             **{f"ln1.{k}": v for k, v in self.ln1.grads.items()},
@@ -263,17 +290,53 @@ class Block:
 
 
 class GPT:
-    """The full model. Config: vocab_size, block_size, n_layer, n_head, n_embd."""
+    """The full model. Config: vocab_size, block_size, n_layer, n_head, n_embd.
+    `dropout` is a training-time regulariser (0 = off); call eval() before
+    scoring or sampling and train() to switch it back on."""
 
-    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=128, seed=0):
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=128, seed=0,
+                 dropout=0.0):
         rng = np.random.default_rng(seed)
+        self.drop_rng = np.random.default_rng(seed + 1)     # masks; reseedable
         self.block_size = block_size
         self.wte = Embedding(vocab_size, n_embd, rng)
         self.wpe = Embedding(block_size, n_embd, rng)
-        self.blocks = [Block(n_embd, n_head, rng) for _ in range(n_layer)]
+        self.drop = Dropout(dropout, self.drop_rng)         # on the summed embeddings
+        self.blocks = [Block(n_embd, n_head, rng, dropout, self.drop_rng)
+                       for _ in range(n_layer)]
         self.ln_f = LayerNorm(n_embd)
         self.head = Linear(n_embd, vocab_size, rng, scale=0.02)
         self.grads = {}
+
+    # -- dropout control
+    def dropouts(self):
+        ds = [self.drop]
+        for b in self.blocks:
+            ds += [b.attn.attn_drop, b.drop1, b.drop2]
+        return ds
+
+    def train(self):
+        for d in self.dropouts():
+            d.training = True
+        return self
+
+    def eval(self):
+        for d in self.dropouts():
+            d.training = False
+        return self
+
+    def set_dropout(self, p):
+        for d in self.dropouts():
+            d.p = p
+        return self
+
+    def reseed_dropout(self, seed):
+        """Restart the mask stream, so two consecutive forward passes draw
+        identical masks — what the gradient check needs."""
+        self.drop_rng = np.random.default_rng(seed)
+        for d in self.dropouts():
+            d.rng = self.drop_rng
+        return self
 
     def params(self):
         p = {**{f"wte.{k}": v for k, v in self.wte.params().items()},
@@ -302,7 +365,7 @@ class GPT:
             raise ValueError(f"sequence length {past + T} exceeds block_size {self.block_size}; "
                              "crop the input to the last block_size tokens")
         pos = np.arange(past, past + T)
-        x = self.wte.forward(idx) + self.wpe.forward(pos)   # (B,T,n_embd)
+        x = self.drop.forward(self.wte.forward(idx) + self.wpe.forward(pos))  # (B,T,n_embd)
         for i, b in enumerate(self.blocks):
             x = b.forward(x, cache[i] if cache is not None else None)
         x = self.ln_f.forward(x)
@@ -333,6 +396,7 @@ class GPT:
         dx = self.ln_f.backward(dx)
         for b in reversed(self.blocks):
             dx = b.backward(dx)
+        dx = self.drop.backward(dx)
         self.wte.backward(dx)
         self.wpe.backward(dx.sum(0))                        # pos emb shared over batch
 
