@@ -43,6 +43,8 @@ def main():
                     help="linear warmup steps before cosine decay (0 = constant lr)")
     ap.add_argument("--min-lr", type=float, default=3e-4,
                     help="learning rate the cosine schedule decays to by the last step")
+    ap.add_argument("--dtype", choices=["float32", "float64"], default="float32",
+                    help="float32 trains ~1.8x faster; float64 is what the gradient check uses")
     ap.add_argument("--dropout", type=float, default=0.1,
                     help="dropout on embeddings, attention weights and residual branches")
     ap.add_argument("--weight-decay", type=float, default=0.1,
@@ -68,13 +70,13 @@ def main():
         print(f"resumed {args.out} at step {start}")
     else:
         model = GPT(data.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd,
-                    seed=args.seed, dropout=args.dropout)
+                    seed=args.seed, dropout=args.dropout, dtype=getattr(np, args.dtype))
         opt = Adam(model.params(), lr=args.lr, weight_decay=args.weight_decay)
         start = 0
     cfg = [model.wte.W.shape[0], model.block_size, len(model.blocks),
            model.blocks[0].attn.n_head, model.wte.W.shape[1]]
     n_params = sum(p.size for p in model.params().values())
-    print(f"corpus vocab {data.vocab_size} | {n_params:,} parameters | {args.steps} steps")
+    print(f"corpus vocab {data.vocab_size} | {n_params:,} parameters ({model.dtype}) | {args.steps} steps")
 
     def save(step):
         checkpoint.save(args.out, model, data.itos, cfg, step=step, opt=opt)

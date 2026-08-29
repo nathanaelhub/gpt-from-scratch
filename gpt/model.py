@@ -16,8 +16,9 @@ stashes the gradients of its own parameters in `self.grads`). Nothing here calls
 an autograd library — the chain rule is spelled out. `gradcheck.py` verifies the
 whole thing against central finite differences.
 
-Arrays are float64 so the gradient check is exact to ~1e-7; the model is tiny so
-the speed cost doesn't matter.
+Arrays default to float64 so the gradient check is exact to ~1e-7. Pass
+dtype=np.float32 to GPT for ~2x faster training once the calculus is trusted;
+the gradient check keeps using float64.
 """
 from __future__ import annotations
 
@@ -37,30 +38,39 @@ def log_softmax(x, axis=-1):
     return z - np.log(np.exp(z).sum(axis=axis, keepdims=True))
 
 
-# tanh-approximation GELU (what GPT-2 uses) and its exact derivative
-_GC = np.sqrt(2.0 / np.pi)
+# tanh-approximation GELU (what GPT-2 uses) and its exact derivative.
+# _GC is a plain Python float on purpose: a numpy float64 scalar would upcast
+# float32 activations to float64 on every call.
+_GC = float(np.sqrt(2.0 / np.pi))
 
 
-def gelu(x):
-    inner = _GC * (x + 0.044715 * x**3)
-    return 0.5 * x * (1.0 + np.tanh(inner))
+def gelu(x, _t=None):
+    """GELU. Pass _t=(the tanh term) to skip recomputing it."""
+    t = np.tanh(_GC * (x + 0.044715 * (x * x * x))) if _t is None else _t
+    return 0.5 * x * (1.0 + t)
 
 
-def dgelu(x):
-    inner = _GC * (x + 0.044715 * x**3)
-    t = np.tanh(inner)
-    dinner = _GC * (1.0 + 3 * 0.044715 * x**2)
-    return 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t**2) * dinner
+def gelu_tanh(x):
+    """The tanh term of gelu(x), cached by MLP.forward so dgelu can reuse it
+    (tanh is the expensive part; x*x*x beats x**3 by avoiding np.power)."""
+    return np.tanh(_GC * (x + 0.044715 * (x * x * x)))
+
+
+def dgelu(x, t=None):
+    if t is None:
+        t = gelu_tanh(x)
+    dinner = _GC * (1.0 + 3 * 0.044715 * (x * x))
+    return 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * dinner
 
 
 # ----------------------------------------------------------------------- layers
 class Linear:
     """y = x @ W + b, over the last axis. x: (..., in), y: (..., out)."""
 
-    def __init__(self, n_in, n_out, rng, scale=None):
+    def __init__(self, n_in, n_out, rng, scale=None, dtype=np.float64):
         s = scale if scale is not None else np.sqrt(2.0 / n_in)
-        self.W = (rng.standard_normal((n_in, n_out)) * s)
-        self.b = np.zeros(n_out)
+        self.W = (rng.standard_normal((n_in, n_out)) * s).astype(dtype)
+        self.b = np.zeros(n_out, dtype=dtype)
         self.grads = {}
 
     def params(self):
@@ -82,8 +92,8 @@ class Linear:
 class Embedding:
     """Row lookup: idx (int array) -> vectors. Gradient scatters back to rows."""
 
-    def __init__(self, n, dim, rng):
-        self.W = rng.standard_normal((n, dim)) * 0.02
+    def __init__(self, n, dim, rng, dtype=np.float64):
+        self.W = (rng.standard_normal((n, dim)) * 0.02).astype(dtype)
         self.grads = {}
 
     def params(self):
@@ -103,9 +113,9 @@ class Embedding:
 class LayerNorm:
     """Normalise the last axis, then scale/shift: y = gamma*xhat + beta."""
 
-    def __init__(self, dim, eps=1e-5):
-        self.gamma = np.ones(dim)
-        self.beta = np.zeros(dim)
+    def __init__(self, dim, eps=1e-5, dtype=np.float64):
+        self.gamma = np.ones(dim, dtype=dtype)
+        self.beta = np.zeros(dim, dtype=dtype)
         self.eps = eps
         self.grads = {}
 
@@ -148,7 +158,7 @@ class Dropout:
         if not self.training or self.p == 0.0:
             self.mask = None
             return x
-        self.mask = (self.rng.random(x.shape) >= self.p) / (1.0 - self.p)
+        self.mask = ((self.rng.random(x.shape) >= self.p) / (1.0 - self.p)).astype(x.dtype)
         return x * self.mask
 
     def backward(self, dout):
@@ -158,12 +168,12 @@ class Dropout:
 class CausalSelfAttention:
     """Multi-head causal self-attention. dim must be divisible by n_head."""
 
-    def __init__(self, dim, n_head, rng, dropout=0.0, drop_rng=None):
+    def __init__(self, dim, n_head, rng, dropout=0.0, drop_rng=None, dtype=np.float64):
         assert dim % n_head == 0
         self.n_head = n_head
         self.hd = dim // n_head
-        self.c_attn = Linear(dim, 3 * dim, rng, scale=0.02)  # Q, K, V in one matmul
-        self.c_proj = Linear(dim, dim, rng, scale=0.02)
+        self.c_attn = Linear(dim, 3 * dim, rng, scale=0.02, dtype=dtype)  # Q, K, V in one matmul
+        self.c_proj = Linear(dim, dim, rng, scale=0.02, dtype=dtype)
         self.attn_drop = Dropout(dropout, drop_rng)          # on the attention weights
         self.grads = {}
 
@@ -193,11 +203,11 @@ class CausalSelfAttention:
         self.q, self.k, self.v = q, k, v
         Tk = k.shape[2]                                    # keys = past + new
         past = Tk - T
-        scale = 1.0 / np.sqrt(self.hd)
+        scale = self.hd ** -0.5                            # Python float: keeps float32 float32
         att = (q @ k.transpose(0, 1, 3, 2)) * scale        # (B,nh,T,Tk)
         # query i sits at absolute position past+i and may see keys <= past+i
         mask = np.triu(np.ones((T, Tk), dtype=bool), k=past + 1)
-        att = np.where(mask, -1e9, att)
+        att = np.where(mask, att.dtype.type(-1e9), att)
         self.p = softmax(att, axis=-1)
         self.scale = scale
         self.pd = self.attn_drop.forward(self.p)           # dropped-out weights
@@ -231,9 +241,9 @@ class CausalSelfAttention:
 class MLP:
     """Position-wise feed-forward: Linear -> GELU -> Linear, 4x hidden."""
 
-    def __init__(self, dim, rng):
-        self.fc = Linear(dim, 4 * dim, rng, scale=0.02)
-        self.proj = Linear(4 * dim, dim, rng, scale=0.02)
+    def __init__(self, dim, rng, dtype=np.float64):
+        self.fc = Linear(dim, 4 * dim, rng, scale=0.02, dtype=dtype)
+        self.proj = Linear(4 * dim, dim, rng, scale=0.02, dtype=dtype)
         self.grads = {}
 
     def params(self):
@@ -242,11 +252,12 @@ class MLP:
 
     def forward(self, x):
         self.h = self.fc.forward(x)
-        return self.proj.forward(gelu(self.h))
+        self.t = gelu_tanh(self.h)                # reused by backward
+        return self.proj.forward(gelu(self.h, self.t))
 
     def backward(self, dout):
         dg = self.proj.backward(dout)
-        dx = self.fc.backward(dg * dgelu(self.h))
+        dx = self.fc.backward(dg * dgelu(self.h, self.t))
         self.grads = {**{f"fc.{k}": v for k, v in self.fc.grads.items()},
                       **{f"proj.{k}": v for k, v in self.proj.grads.items()}}
         return dx
@@ -256,12 +267,12 @@ class Block:
     """Pre-norm transformer block with residual connections. Dropout sits on
     each branch's output before it is added back (GPT-2's resid_dropout)."""
 
-    def __init__(self, dim, n_head, rng, dropout=0.0, drop_rng=None):
-        self.ln1 = LayerNorm(dim)
-        self.attn = CausalSelfAttention(dim, n_head, rng, dropout, drop_rng)
+    def __init__(self, dim, n_head, rng, dropout=0.0, drop_rng=None, dtype=np.float64):
+        self.ln1 = LayerNorm(dim, dtype=dtype)
+        self.attn = CausalSelfAttention(dim, n_head, rng, dropout, drop_rng, dtype)
         self.drop1 = Dropout(dropout, drop_rng)
-        self.ln2 = LayerNorm(dim)
-        self.mlp = MLP(dim, rng)
+        self.ln2 = LayerNorm(dim, dtype=dtype)
+        self.mlp = MLP(dim, rng, dtype)
         self.drop2 = Dropout(dropout, drop_rng)
         self.grads = {}
 
@@ -295,17 +306,18 @@ class GPT:
     scoring or sampling and train() to switch it back on."""
 
     def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=128, seed=0,
-                 dropout=0.0):
+                 dropout=0.0, dtype=np.float64):
         rng = np.random.default_rng(seed)
         self.drop_rng = np.random.default_rng(seed + 1)     # masks; reseedable
         self.block_size = block_size
-        self.wte = Embedding(vocab_size, n_embd, rng)
-        self.wpe = Embedding(block_size, n_embd, rng)
+        self.dtype = np.dtype(dtype)
+        self.wte = Embedding(vocab_size, n_embd, rng, dtype)
+        self.wpe = Embedding(block_size, n_embd, rng, dtype)
         self.drop = Dropout(dropout, self.drop_rng)         # on the summed embeddings
-        self.blocks = [Block(n_embd, n_head, rng, dropout, self.drop_rng)
+        self.blocks = [Block(n_embd, n_head, rng, dropout, self.drop_rng, dtype)
                        for _ in range(n_layer)]
-        self.ln_f = LayerNorm(n_embd)
-        self.head = Linear(n_embd, vocab_size, rng, scale=0.02)
+        self.ln_f = LayerNorm(n_embd, dtype=dtype)
+        self.head = Linear(n_embd, vocab_size, rng, scale=0.02, dtype=dtype)
         self.grads = {}
 
     # -- dropout control

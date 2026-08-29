@@ -12,7 +12,7 @@ import pytest
 from gpt import checkpoint
 from gpt.data import CharData, encode
 from gpt.gradcheck import gradcheck
-from gpt.model import GPT, Dropout, dgelu, gelu, log_softmax, softmax
+from gpt.model import GPT, Dropout, dgelu, gelu, gelu_tanh, log_softmax, softmax
 from gpt.optim import Adam, clip_grad_norm, lr_at
 
 
@@ -62,6 +62,12 @@ def test_gelu_derivative_matches_numeric():
     eps = 1e-6
     num = (gelu(x + eps) - gelu(x - eps)) / (2 * eps)
     assert np.allclose(dgelu(x), num, atol=1e-6)
+    # the cached-tanh path is the same function
+    t = gelu_tanh(x)
+    assert np.array_equal(gelu(x, t), gelu(x)) and np.array_equal(dgelu(x, t), dgelu(x))
+    # and it must not upcast float32 (a numpy scalar constant would)
+    assert gelu(x.astype(np.float32)).dtype == np.float32
+    assert dgelu(x.astype(np.float32)).dtype == np.float32
 
 
 def test_forward_shapes():
@@ -269,3 +275,30 @@ def test_model_dropout_only_acts_in_train_mode():
     m.reseed_dropout(7); e = m.forward(idx)
     m.reseed_dropout(7); f = m.forward(idx)
     assert np.array_equal(e, f)                             # reseeding fixes the masks
+
+
+def test_float32_model_matches_float64_and_stays_float32_through_training():
+    kw = dict(vocab_size=20, block_size=8, n_layer=2, n_head=2, n_embd=16, seed=0)
+    m64 = GPT(**kw)
+    m32 = GPT(**kw, dtype=np.float32)
+    assert all(v.dtype == np.float32 for v in m32.params().values())
+    rng = np.random.default_rng(0)
+    x = rng.integers(0, 20, (4, 8)); y = rng.integers(0, 20, (4, 8))
+    assert np.allclose(m32.forward(x), m64.forward(x), rtol=1e-4, atol=1e-4)
+    assert np.isclose(m32.loss(x, y), m64.loss(x, y), rtol=1e-5)
+    grads = m32.backward()
+    assert all(g.dtype == np.float32 for g in grads.values())
+    opt = Adam(m32.params(), lr=3e-3, weight_decay=0.1)
+    first = m32.loss(x, y)
+    for _ in range(30):
+        m32.loss(x, y); g = m32.backward(); clip_grad_norm(g, 1.0); opt.step(g)
+    assert m32.loss(x, y) < first - 0.3
+    assert all(v.dtype == np.float32 for v in m32.params().values())   # updates didn't upcast
+
+
+def test_checkpoint_preserves_dtype(tmp_path):
+    m = GPT(vocab_size=6, block_size=4, n_layer=1, n_head=2, n_embd=8, dtype=np.float32)
+    path = tmp_path / "ck32.npz"
+    checkpoint.save(path, m, dict(enumerate("abcdef")), [6, 4, 1, 2, 8])
+    m2, *_ = checkpoint.load(path)
+    assert m2.dtype == np.float32 and all(v.dtype == np.float32 for v in m2.params().values())
