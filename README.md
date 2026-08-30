@@ -21,9 +21,13 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python -m gpt.gradcheck          # verify every gradient (~1e-6 error) — do this first
-python train.py --steps 2500     # train on tiny-shakespeare (CPU, a few minutes)
+python train.py                  # 2,000 steps on tiny-shakespeare (CPU, ~3 minutes)
+python eval.py                   # exact val loss / perplexity / bits-per-char
 python sample.py --prompt "ROMEO:" --n 400
 ```
+
+Training checkpoints every `--eval-every` steps and on Ctrl-C, so a killed run
+can be picked up with `python train.py --resume`.
 
 ## Architecture
 
@@ -44,10 +48,11 @@ x = x + CausalSelfAttention(LayerNorm(x))
 x = x + MLP(LayerNorm(x))
 ```
 
-Every layer (`Linear`, `Embedding`, `LayerNorm`, `CausalSelfAttention`, `MLP`,
-`Block`, `GPT`) is an object with a `forward` that caches what it needs and a
-`backward` that returns the gradient w.r.t. its input and stashes its parameter
-gradients — the chain rule, spelled out. See [`gpt/model.py`](gpt/model.py).
+Every layer (`Linear`, `Embedding`, `LayerNorm`, `Dropout`,
+`CausalSelfAttention`, `MLP`, `Block`, `GPT`) is an object with a `forward` that
+caches what it needs and a `backward` that returns the gradient w.r.t. its input
+and stashes its parameter gradients — the chain rule, spelled out. See
+[`gpt/model.py`](gpt/model.py).
 
 ## The math that's easy to get wrong
 
@@ -73,7 +78,17 @@ with `dŷ = dout ⊙ γ`. Getting the two mean-subtraction terms right is the wh
 game; the gradient check is what tells you they are.
 
 **Softmax + cross-entropy** collapse, as always, to `dlogits = P − onehot(y)`,
-averaged over all `B·T` positions.
+averaged over all `B·T` positions. The loss itself is computed as a log-softmax
+(`logits − logsumexp`) rather than `log(softmax)`, so it stays exact when a
+target's probability underflows to zero.
+
+**Dropout** is inverted dropout (survivors scaled by `1/(1−p)`) on the summed
+embeddings, on the attention weights after the softmax, and on each residual
+branch. Its backward is just the cached mask — but through the attention
+weights the mask sits *between* `P V` and the softmax Jacobian, which is the
+easy place to get the order wrong. The gradient check runs with dropout on
+(`gradcheck(dropout=0.2)`) by restarting the mask stream before every loss
+call, so the finite differences see the same masks the backward pass did.
 
 ## Gradient checking
 
@@ -93,9 +108,37 @@ worst relative error across all parameters: 2.91e-06
 PASS
 ```
 
+## Training recipe
+
+`train.py` follows the GPT-2 / nanoGPT recipe, all of it implemented here:
+
+| flag | default | what |
+|---|---|---|
+| `--lr` / `--warmup` / `--min-lr` | 3e-3 / 100 / 3e-4 | linear warmup, then cosine decay to `min-lr` at the last step |
+| `--weight-decay` | 0.1 | **decoupled** (AdamW) decay on matmul/embedding weights only — LayerNorm gains and biases are not decayed |
+| `--grad-clip` | 1.0 | clip the global gradient norm; the pre-clip norm is printed each eval |
+| `--dropout` | 0.1 | embeddings, attention weights, residual branches |
+| `--dtype` | float32 | ~1.8× faster than float64 on CPU; the gradient check always uses float64 |
+| `--eval-every` | 250 | evaluate, write `--log` (CSV), and checkpoint |
+| `--resume` | | continue from `--out`: params, Adam moments, and step |
+
+`plot_loss.py` turns the CSV into `docs/loss.png`. `eval.py` scores a checkpoint
+on the *whole* validation split (train.py's running estimate is 20 random
+batches) and reports perplexity and bits-per-character.
+
+## Sampling
+
+`sample.py` uses a **KV cache**: each new character runs only itself through
+the model and attends to the cached keys/values, instead of re-running the
+whole context. With learned absolute positions the cache can't slide, so once
+the window is full it's rebuilt from the most recent `block_size/2` characters
+and filling resumes; `--no-cache` recomputes the full window every step
+(identical output within one window, a lot slower past it). `--temperature`
+and `--top-k` do what you'd expect.
+
 ## Results
 
-Training the default ~0.6 M-parameter model on tiny-shakespeare (1,200 steps,
+Training the default ~0.6 M-parameter model on tiny-shakespeare (2,000 steps,
 a few minutes on CPU), cross-entropy drops from the `ln(vocab) ≈ 4.17` random
 baseline to ~1.9, and the samples go from noise to Shakespeare-shaped text —
 speaker headings, the play's blank-line structure, and mostly-real words:
@@ -127,13 +170,16 @@ improving it.
 ```
 gpt-from-scratch/
 ├── gpt/
-│   ├── model.py       # layers + GPT: forward and hand-derived backward
-│   ├── optim.py       # Adam
+│   ├── model.py       # layers + GPT: forward and hand-derived backward, KV cache
+│   ├── optim.py       # AdamW, gradient clipping, LR schedule
 │   ├── data.py        # char-level tokenizer + batching
+│   ├── checkpoint.py  # save/load model + optimizer state (atomic)
 │   └── gradcheck.py   # numerical gradient verification
-├── train.py           # training loop → checkpoint.npz
-├── sample.py          # autoregressive generation
-├── tests/             # pytest: gradient check, causality, convergence
+├── train.py           # training loop → checkpoint.npz + train_log.csv
+├── eval.py            # exact validation loss / perplexity / bits-per-char
+├── sample.py          # autoregressive generation (KV-cached)
+├── plot_loss.py       # train_log.csv → docs/loss.png
+├── tests/             # pytest: gradient check, causality, cache, convergence …
 └── data/              # tiny-shakespeare
 ```
 
@@ -141,7 +187,8 @@ gpt-from-scratch/
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # gradient check + causality + training-reduces-loss + more
+pytest            # 24 tests: gradient checks (with and without dropout), causality,
+                  # KV cache == full recompute, schedule, AdamW, checkpoints, dtype …
 ```
 
 CI runs the whole suite — including the gradient check — on every push.
