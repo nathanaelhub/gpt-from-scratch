@@ -138,32 +138,43 @@ and `--top-k` do what you'd expect.
 
 ## Results
 
-Training the default ~0.6 M-parameter model on tiny-shakespeare (2,000 steps,
-a few minutes on CPU), cross-entropy drops from the `ln(vocab) ≈ 4.17` random
-baseline to ~1.9, and the samples go from noise to Shakespeare-shaped text —
-speaker headings, the play's blank-line structure, and mostly-real words:
+The default ~0.6 M-parameter model (3 layers, 4 heads, 128-dim, 64-char
+context), 2,000 steps of the recipe above, a few minutes on a laptop CPU:
+
+![train and validation loss](docs/loss.png)
+
+| | |
+|---|---|
+| validation cross-entropy (`eval.py`, whole split) | **1.698 nats/char** |
+| perplexity | 5.46 |
+| bits per character | 2.45 |
+| random baseline `ln(65)` | 4.17 nats |
+
+Train loss ends at 1.51, so there's a ~0.2-nat generalisation gap even with
+dropout — expected for a 1 MB corpus. Samples go from noise to
+Shakespeare-shaped text: speaker headings, the play's line structure, and
+mostly-real words, with the grammar still wobbling
+(`python sample.py --prompt "ROMEO:" --n 400`):
 
 ```
 ROMEO:
-That wither the the all shyse shall my'sing,
-Which fre coul me of dur surs lows,
-I then bows to's us erveres that
-ans the will fall the thy nour this.
+Ha! which 'tis the accosets of York, when here are unferse me perful
+To withis son.
 
-COPUS:
-And you the your russ.
+MINIUS:
+Your somes of Edward, were love we him.
 
-LUCES O:
-Now, to in be warwar!
-
-First:
-All mare more ervy words, I have lookely.
+GREY:
+O, it who in my frame you; what are your confessains wifess breatore;
+First not be the pernow resot with subs?
+When I would lie 'twas your kings, that me revent;
+This you shall both and then name's man:
+Rail you; and in the and bid time of dogs.
 ```
 
-It has clearly learned English word shapes, punctuation, and the speaker/line
-format — but it's a tiny character model trained for minutes, so it's not going
-to write a real sonnet. More steps and a bigger `--n-embd`/`--n-layer` keep
-improving it.
+It's a tiny character model trained for minutes, so it's not going to write a
+real sonnet. More steps and a bigger `--n-embd`/`--n-layer`/`--block-size`
+keep improving it.
 
 ## Project layout
 
